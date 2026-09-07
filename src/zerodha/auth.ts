@@ -27,7 +27,7 @@ export interface AuthResult {
  * The request_token is single-use and only valid for a couple of minutes,
  * so this server is only ever up for the duration of one login attempt.
  */
-function waitForRequestToken(port: number, callbackPath: string): Promise<string> {
+function waitForRequestToken(callbackPath: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
       if (!req.url) {
@@ -103,7 +103,6 @@ async function runLoginFlow(kc: Connect, config: AppConfig): Promise<SessionData
   logger.info("Waiting for redirect back to the local callback server...");
 
   const requestToken = await waitForRequestToken(
-    config.kite.redirect.port,
     config.kite.redirect.path
   );
 
