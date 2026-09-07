@@ -1,0 +1,20 @@
+diff --git a/node_modules/kiteconnect/types/connect.d.ts b/node_modules/kiteconnect/types/connect.d.ts
+index 270a482..4e83b48 100644
+--- a/node_modules/kiteconnect/types/connect.d.ts
++++ b/node_modules/kiteconnect/types/connect.d.ts
+@@ -1651,10 +1651,14 @@ export type Connect = {
+    * Get account balance and cash margin details for a particular segment.
+    * @param segment trading segment (eg: equity or commodity).
+    */
+-  getMargins: (segment?: 'equity' | 'commodity') => Promise<{
++  getMargins: {
++  (): Promise<{
+     equity?: UserMargin;
+     commodity?: UserMargin;
+   }>;
++ (segment: 'equity' | 'commodity'): Promise<UserMargin>; 
++  
++};
+ 
+   /**
+    * Get list of mutual fund holdings.
