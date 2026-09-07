@@ -76,9 +76,13 @@ function waitForRequestToken(port: number, callbackPath: string): Promise<string
       );
     });
 
-    server.listen(port, "127.0.0.1", () => {
-      logger.info("Local redirect listener started", {
-        url: `http://127.0.0.1:${port}${callbackPath}`,
+    const port = Number(process.env.PORT) || 3000;
+
+    server.listen(port, "0.0.0.0", () => {
+      logger.info("Redirect listener started", {
+      port,
+      path: callbackPath,
+      host: "0.0.0.0",
       });
     });
   });
