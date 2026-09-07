@@ -98,6 +98,14 @@ export interface AppConfig {
   logging: {
     level: string;
   };
+    costs?: {
+    brokeragePerOrder: number;
+    sttPct: number;
+    exchangeTxnPct: number;
+    gstRate: number;
+    stampDutyPct: number;
+    slippagePct: number;
+  };
 }
 
 function optionalNumberOrUndefined(name: string): number | undefined {
@@ -146,6 +154,14 @@ export function loadConfig(): AppConfig {
     },
     logging: {
       level: optionalString("LOG_LEVEL", "info"),
+    },
+    costs: {
+      brokeragePerOrder: optionalNumber("TRANSACTION_BROKERAGE_PER_ORDER", 20),
+      sttPct:            optionalNumber("TRANSACTION_STT_PCT",             0.00025),
+      exchangeTxnPct:    optionalNumber("TRANSACTION_EXCHANGE_PCT",        0.0000345),
+      gstRate:           optionalNumber("TRANSACTION_GST_RATE",            0.18),
+      stampDutyPct:      optionalNumber("TRANSACTION_STAMP_PCT",           0.00003),
+      slippagePct:       optionalNumber("TRANSACTION_SLIPPAGE_PCT",        0.0005),
     },
   };
 

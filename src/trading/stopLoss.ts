@@ -3,7 +3,7 @@ import type { AppConfig } from "../config/env";
 import type { Trade } from "../types/trading";
 import { placeOrder, cancelOrder } from "../zerodha/orders";
 import { calculateStopLossPrice, calculateTargetPrice } from "../risk/positionSizing";
-import { setStopLoss, setTarget, updateTradeState, markExited } from "./positionManager";
+import { setStopLoss, setTarget, markExited } from "./positionManager";
 import { logger } from "../utils/logger";
 
 /**
@@ -19,9 +19,12 @@ import { logger } from "../utils/logger";
  * The trigger price must be tick-aligned - we recalculate from actual fill
  * price here, not from the scan-time estimate, per the spec requirement.
  */
+export const DEFAULT_TICK_SIZE = 0.05;
+
 export async function placeBrokerStopLoss(
   kc: Connect,
   trade: Trade,
+  tickSize: number,
   config: AppConfig
 ): Promise<Trade | null> {
   if (!trade.entryPrice || !trade.quantity) {
@@ -31,7 +34,7 @@ export async function placeBrokerStopLoss(
 
   // Fetch tickSize from the trade - it was carried through from ResolvedInstrument.
   // We store it on the trade object via the caller (executeTrade).
-  const tickSize = (trade as Trade & { tickSize?: number }).tickSize ?? 0.05;
+  // const tickSize = (trade as Trade & { tickSize?: number }).tickSize ?? 0.05;
 
   const slPrice = calculateStopLossPrice(
     trade.side,

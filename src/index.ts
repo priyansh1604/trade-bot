@@ -3,44 +3,31 @@ import { logger } from "./utils/logger";
 import { createKiteClient } from "./zerodha/client";
 import { authenticate } from "./zerodha/auth";
 import { fetchProfile, fetchMargins, fetchPositions } from "./zerodha/account";
-import { fetchOrders } from "./zerodha/orders";
+import { fetchOrders, placeOrder } from "./zerodha/orders";
 import { fetchInstruments } from "./zerodha/instruments";
-import { createTicker, resolveInstrumentTokens, wireTicker } from "./zerodha/marketData";
+import { createTicker, wireTicker } from "./zerodha/marketData";
+import { resolveMidcap150Universe } from "./strategy/universe";
 import { runMorningScan } from "./strategy/strategy";
 import { planFromSignal } from "./risk/riskManager";
 import { placeEntryOrder } from "./trading/entry";
-import { placeBrokerStopLoss, emergencyExit } from "./trading/stopLoss";
+import { placeBrokerStopLoss, emergencyExit, cancelStopLoss, DEFAULT_TICK_SIZE } from "./trading/stopLoss";
+import { checkTargets, calculateNetPnl } from "./trading/target";
 import { reconcile } from "./trading/reconciliation";
 import { scheduleMarketEvents } from "./scheduler/marketSchedule";
+import { markExited } from "./trading/positionManager";
 import type { Trade } from "./types/trading";
-import type { Instrument, Connect, Tick } from "kiteconnect";
+import type { Connect, Instrument, Tick } from "kiteconnect";
 import type { AppConfig } from "./config/env";
 
-/**
- * PHASE 7 ENTRYPOINT
- *
- * Adds the full execution engine:
- *   - Startup reconciliation (Zerodha state = source of truth)
- *   - Persistent scheduler (09:15 market open, 09:20 scan, 09:21 entry, 15:00 force exit)
- *   - Entry order + fill verification
- *   - Immediate broker-side SL-M placement
- *   - Emergency exit if SL placement fails
- *   - LIVE_TRADING_ENABLED safety switch enforced at every order call
- *
- * Target monitoring (Phase 8) and the force-exit implementation (Phase 9)
- * are wired to placeholder stubs here so the scheduler structure is visible.
- */
-
-// In-memory trade state. Zerodha is always the source of truth.
-// On restart, reconcile() rebuilds this from the broker.
 let activeTrades: Trade[] = [];
+let tickSizeByToken: Map<number, number> = new Map();
 
 async function runEntrySequence(
   kc: Connect,
   instruments: Instrument[],
   config: AppConfig
 ): Promise<void> {
-  logger.info("Running 09:20 scanner over the Nifty Midcap 150 universe...");
+  logger.info("Running 09:20 scanner over Nifty Midcap 150...");
 
   let signal;
   try {
@@ -51,95 +38,162 @@ async function runEntrySequence(
   }
 
   logger.info("Scan finished", {
-    long: signal.long ? { symbol: signal.long.symbol, changePct: Number(signal.long.changePct.toFixed(2)) } : null,
+    long:  signal.long  ? { symbol: signal.long.symbol,  changePct: Number(signal.long.changePct.toFixed(2))  } : null,
     short: signal.short ? { symbol: signal.short.symbol, changePct: Number(signal.short.changePct.toFixed(2)) } : null,
   });
 
   const plan = planFromSignal(signal, config);
 
-  for (const [side, plannedTrade] of [["LONG", plan.long], ["SHORT", plan.short]] as const) {
-    if (!plannedTrade) continue;
+  for (const side of ["LONG", "SHORT"] as const) {
+    const planned = side === "LONG" ? plan.long : plan.short;
+    if (!planned) continue;
 
-    // Don't re-enter if we already have an active trade on this side
     if (activeTrades.some((t) => t.side === side && (t.state === "OPEN" || t.state === "ENTRY_PENDING"))) {
-      logger.warn(`Already have an active ${side} position - skipping entry`, { symbol: plannedTrade.symbol });
+      logger.warn(`Already have an active ${side} - skipping`, { symbol: planned.symbol });
       continue;
     }
 
-    logger.info(`Entering ${side}`, { symbol: plannedTrade.symbol, quantity: plannedTrade.quantity });
+    logger.info(`[${side} ENTRY]`, {
+      symbol: planned.symbol,
+      quantity: planned.quantity,
+      referencePrice: planned.referencePrice,
+      estimatedSL: planned.stopLossPrice,
+      estimatedTarget: planned.targetPrice,
+    });
 
-    const trade = await placeEntryOrder(kc, plannedTrade, config);
+    const trade = await placeEntryOrder(kc, planned, config);
     if (!trade || trade.state === "FAILED") {
-      logger.error(`${side} entry failed`, { symbol: plannedTrade.symbol });
+      logger.error(`${side} entry failed`, { symbol: planned.symbol });
       continue;
     }
 
-    // Immediately place the broker-side stop-loss
-    // Attach tickSize to the trade object so placeBrokerStopLoss can use it
-    (trade as Trade & { tickSize?: number }).tickSize = plannedTrade.token
-      ? (instruments.find((i) => Number(i.instrument_token) === plannedTrade.token)?.tick_size
-          ? Number(instruments.find((i) => Number(i.instrument_token) === plannedTrade.token)!.tick_size)
-          : 0.05)
-      : 0.05;
+    const tickSize =
+      tickSizeByToken.get(planned.token) ??
+      Number(instruments.find((i) => Number(i.instrument_token) === planned.token)?.tick_size ?? DEFAULT_TICK_SIZE);
 
-    const tradeWithSL = await placeBrokerStopLoss(kc, trade, config);
-
+    const tradeWithSL = await placeBrokerStopLoss(kc, trade, tickSize, config);
     if (!tradeWithSL) {
-      // CRITICAL FAILURE: entry succeeded but SL failed -> emergency exit
-      logger.error("SL placement failed after entry - triggering emergency exit", { symbol: trade.symbol });
-      const aborted = await emergencyExit(kc, trade, config);
-      activeTrades.push(aborted);
+      logger.error("SL placement failed - emergency exit", { symbol: trade.symbol });
+      activeTrades.push(await emergencyExit(kc, trade, config));
       continue;
     }
 
     activeTrades.push(tradeWithSL);
-    logger.info("Trade open with broker SL protection", {
-      symbol: tradeWithSL.symbol,
-      side: tradeWithSL.side,
-      quantity: tradeWithSL.quantity,
-      entryPrice: tradeWithSL.entryPrice,
-      slPrice: tradeWithSL.stopLossPrice,
+    logger.info("Trade OPEN with broker SL", {
+      symbol:      tradeWithSL.symbol,
+      side:        tradeWithSL.side,
+      quantity:    tradeWithSL.quantity,
+      entryPrice:  tradeWithSL.entryPrice,
+      slPrice:     tradeWithSL.stopLossPrice,
+      slOrderId:   tradeWithSL.stopLossOrderId,
       targetPrice: tradeWithSL.targetPrice,
-      slOrderId: tradeWithSL.stopLossOrderId,
     });
   }
 }
 
 async function forceExitAll(kc: Connect, config: AppConfig): Promise<void> {
-  // Phase 9: implement forced exit of all open positions at 15:00.
-  // Stub for now - log a clear message so it's obvious this needs completing.
-  logger.warn("15:00 FORCE EXIT triggered - Phase 9 not yet implemented. Manual exit required if positions are open.", {
-    openTrades: activeTrades.filter((t) => t.state === "OPEN").length,
+  logger.info("=== 15:00 FORCE EXIT ===");
+
+  const toClose = activeTrades.filter((t) => t.state === "OPEN" || t.state === "TARGET_EXIT_PENDING");
+  if (toClose.length === 0) {
+    logger.info("No open positions at 15:00");
+  }
+
+  for (let i = 0; i < activeTrades.length; i++) {
+    const trade = activeTrades[i];
+    if (trade.state !== "OPEN" && trade.state !== "TARGET_EXIT_PENDING") continue;
+
+    const exitSide = trade.side === "LONG" ? "SHORT" : "LONG";
+    let exitPrice = trade.entryPrice ?? 0;
+
+    try {
+      const result = await placeOrder(
+        kc,
+        { tradingsymbol: trade.symbol, quantity: trade.quantity, side: exitSide, orderType: "MARKET", tag: "ZMBOT_EOD" },
+        config
+      );
+      if (!result.blocked) logger.info("Force exit order placed", { symbol: trade.symbol, orderId: result.orderId });
+    } catch (err) {
+      logger.error("Force exit order FAILED - manual intervention required", {
+        symbol: trade.symbol,
+        error: (err as Error).message,
+      });
+    }
+
+    // Cancel SL after exit (prevent orphan SL from creating a new position)
+    await cancelStopLoss(kc, trade, config);
+
+    const gross = trade.entryPrice !== undefined
+      ? ((trade.side === "LONG" ? exitPrice - trade.entryPrice : trade.entryPrice - exitPrice) * trade.quantity)
+      : 0;
+    const net = calculateNetPnl(gross, trade.quantity, exitPrice, trade.entryPrice ?? exitPrice, config);
+
+    activeTrades[i] = markExited(trade, "FORCE_EXIT", exitPrice, gross, net);
+    logger.info("Position closed", {
+      symbol: trade.symbol,
+      side: trade.side,
+      entryPrice: trade.entryPrice,
+      exitPrice,
+      grossPnl: `₹${gross.toFixed(2)}`,
+      netPnl:   `₹${net.toFixed(2)}`,
+    });
+  }
+
+  printDailySummary();
+}
+
+function printDailySummary(): void {
+  logger.info("=== DAILY P&L SUMMARY ===");
+  let totalGross = 0;
+  let totalNet = 0;
+
+  for (const t of activeTrades) {
+    const gross = t.grossPnl ?? 0;
+    const net   = t.netPnl   ?? 0;
+    totalGross += gross;
+    totalNet   += net;
+    logger.info(`  ${t.symbol} [${t.side}]`, {
+      state:      t.state,
+      exitReason: t.exitReason,
+      entryPrice: t.entryPrice,
+      exitPrice:  t.exitPrice,
+      grossPnl:   `₹${gross.toFixed(2)}`,
+      netPnl:     `₹${net.toFixed(2)}`,
+    });
+  }
+
+  logger.info("TOTALS", {
+    grossPnl: `₹${totalGross.toFixed(2)}`,
+    netPnl:   `₹${totalNet.toFixed(2)}`,
+    trades:   activeTrades.length,
   });
 }
 
 async function main(): Promise<void> {
-  logger.info("Starting zerodha-midcap-trading-bot (Phase 7 - execution engine)");
+  logger.info("Starting zerodha-midcap-trading-bot");
 
   let config;
   try {
     config = loadConfig();
   } catch (err) {
-    logger.error("Failed to load configuration", { error: (err as Error).message });
+    logger.error("Config load failed", { error: (err as Error).message });
     process.exitCode = 1;
     return;
   }
 
   logger.setLevel(config.logging.level as "debug" | "info" | "warn" | "error");
-
   logger.info("Configuration loaded", {
-    tradingMode: config.trading.mode,
     liveTradingEnabled: config.trading.liveTradingEnabled,
-    capitalLongMax: config.risk.capitalLongMax,
-    capitalShortMax: config.risk.capitalShortMax,
-    stopLossPct: config.risk.stopLossPct,
-    targetPct: config.risk.targetPct,
+    capitalLong:  config.risk.capitalLongMax,
+    capitalShort: config.risk.capitalShortMax,
+    stopLossPct:  `${config.risk.stopLossPct  * 100}%`,
+    targetPct:    `${config.risk.targetPct    * 100}%`,
   });
 
   if (config.trading.liveTradingEnabled) {
-    logger.warn("LIVE_TRADING_ENABLED=true - REAL ORDERS WILL BE PLACED.");
+    logger.warn("⚠️  LIVE_TRADING_ENABLED=true — REAL MONEY ORDERS WILL BE PLACED");
   } else {
-    logger.info("LIVE_TRADING_ENABLED=false - safe mode. All orders are blocked and simulated.");
+    logger.info("LIVE_TRADING_ENABLED=false — all orders simulated");
   }
 
   const kc = createKiteClient(config);
@@ -147,10 +201,10 @@ async function main(): Promise<void> {
   let accessToken: string;
   try {
     const auth = await authenticate(kc, config);
-    logger.info("Ready. Access token acquired.", { source: auth.source });
+    logger.info("Authenticated", { source: auth.source });
     accessToken = auth.accessToken;
   } catch (err) {
-    logger.error("Authentication failed", { error: (err as Error).message });
+    logger.error("Auth failed", { error: (err as Error).message });
     process.exitCode = 1;
     return;
   }
@@ -159,81 +213,91 @@ async function main(): Promise<void> {
   try {
     await fetchProfile(kc);
     await fetchMargins(kc);
-    const initialPositions = await fetchPositions(kc);
-    const initialOrders = await fetchOrders(kc);
-
-    // Startup reconciliation - rebuild state from broker before doing anything
-    // On first run activeTrades is empty, so this is mostly a sanity check.
-    // On restart after a crash, this is where we'd detect surviving positions.
-    const { openTrades, closedByBroker } = await reconcile(kc, activeTrades);
-    activeTrades = openTrades;
-
-    if (closedByBroker.length > 0) {
-      logger.info("Positions closed at broker during downtime", { count: closedByBroker.length });
-    }
-
-    void initialPositions;
-    void initialOrders;
-
+    await fetchPositions(kc);
+    await fetchOrders(kc);
     instruments = await fetchInstruments(kc, "NSE");
   } catch (err) {
-    logger.error("Startup checks failed", { error: (err as Error).message });
-    logger.error("Delete kite-session.state.json and re-run if the token is stale.");
+    logger.error("Startup connectivity failed — if token stale, delete kite-session.state.json", {
+      error: (err as Error).message,
+    });
     process.exitCode = 1;
     return;
   }
 
-  // WebSocket - needed for live tick monitoring (target exit in Phase 8)
-  // For Phase 7 we connect it but the onTick handler is a stub.
-  const resolved = resolveInstrumentTokens(instruments, [], "NSE"); // empty for now; Phase 8 subscribes Midcap 150
+  const universe = resolveMidcap150Universe(instruments);
+  logger.info("Midcap 150 universe resolved", { count: universe.length });
+  tickSizeByToken = new Map(universe.map((u) => [u.token, u.tickSize]));
+
+  // Startup reconciliation
+  const { openTrades, closedByBroker } = await reconcile(kc, activeTrades);
+  activeTrades = openTrades;
+  if (closedByBroker.length > 0) {
+    logger.info("Positions closed at broker since last run", { count: closedByBroker.length });
+    for (const t of closedByBroker) logger.info(`  ${t.symbol} [${t.side}] → ${t.state}`);
+  }
+
+  // WebSocket — subscribe full Midcap 150 for live target monitoring
   const ticker = createTicker(config.kite.apiKey, accessToken);
-  wireTicker(ticker, resolved, (_ticks: Tick[]) => {
-    // Phase 8: monitor ticks against active trade target prices here
+
+  wireTicker(ticker, universe, async (ticks: Tick[]) => {
+    if (activeTrades.some((t) => t.state === "OPEN")) {
+      activeTrades = await checkTargets(ticks, activeTrades, kc, config, tickSizeByToken);
+    }
   });
 
   ticker.on("reconnect", async () => {
-    logger.info("WebSocket reconnected - reconciling positions...");
-    const { openTrades } = await reconcile(kc, activeTrades);
-    activeTrades = openTrades;
+    logger.info("WebSocket reconnected — reconciling...");
+    const result = await reconcile(kc, activeTrades);
+    activeTrades = result.openTrades;
+    for (const t of result.closedByBroker) logger.info(`  Reconciled: ${t.symbol} → ${t.state}`);
   });
 
   ticker.connect();
-  logger.info("WebSocket connected");
+  logger.info("WebSocket connected — subscribed to Midcap 150");
 
-  // Schedule the market-hours events
   const cancelSchedule = scheduleMarketEvents(config.schedule, {
-    onMarketOpen: () => {
-      logger.info("Market opened (09:15) - collecting live data");
-    },
+    onMarketOpen: () => { logger.info("Market opened (09:15 IST)"); },
+
     onScanTime: async () => {
       await runEntrySequence(kc, instruments, config);
     },
+
     onEntryTime: () => {
-      logger.info("09:21 - entry window. Orders were placed at scan time (09:20).");
+      logger.info("09:21 entry window", {
+        openPositions: activeTrades.filter((t) => t.state === "OPEN").length,
+      });
     },
+
     onForceExit: async () => {
       await forceExitAll(kc, config);
       cancelSchedule();
-      logger.info("Trading day complete. Keeping process alive to monitor open positions.");
+      ticker.disconnect();
+      logger.info("Trading day complete — exiting in 30s");
+      setTimeout(() => process.exit(0), 30_000);
     },
   });
 
-  logger.info("Bot running. Waiting for market events...", {
+  logger.info("Bot running — waiting for market events", {
     marketOpen: config.schedule.marketOpen,
-    scanTime: config.schedule.scanTime,
-    forceExit: config.schedule.forceExitTime,
+    scan:       config.schedule.scanTime,
+    forceExit:  config.schedule.forceExitTime,
   });
 
-  // Keep the process alive
   process.on("SIGINT", () => {
-    logger.info("SIGINT received - shutting down gracefully");
+    logger.info("SIGINT — shutting down");
     cancelSchedule();
     ticker.disconnect();
+    const open = activeTrades.filter((t) => t.state === "OPEN");
+    if (open.length > 0) {
+      logger.warn("Open positions on shutdown — check Zerodha manually!", {
+        symbols: open.map((t) => t.symbol),
+      });
+    }
     process.exit(0);
   });
 }
 
 main().catch((err) => {
-  logger.error("Unhandled error in main()", { error: (err as Error).message });
+  logger.error("Fatal unhandled error", { error: (err as Error).message });
   process.exitCode = 1;
 });
