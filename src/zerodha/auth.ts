@@ -60,11 +60,20 @@ function waitForRequestToken(callbackPath: string): Promise<string> {
         return;
       }
 
+      logger.info("Zerodha callback received", {
+        status,
+        requestTokenReceived: true,
+      });
+
       res.writeHead(200, { "Content-Type": "text/html" }).end(
         "<html><body><h3>Login successful.</h3><p>You can close this tab and return to the terminal.</p></body></html>"
       );
+
+      logger.info("Resolving request token promise...");
+
       server.close();
       resolve(requestToken);
+      logger.info("Request token promise resolved");
     });
 
     server.on("error", (err) => {
@@ -101,14 +110,20 @@ async function runLoginFlow(kc: Connect, config: AppConfig): Promise<SessionData
   logger.info("Open this URL in your browser to log in to Zerodha:");
   logger.info(loginUrl);
   logger.info("Waiting for redirect back to the local callback server...");
+  logger.info("Waiting for request token promise...");
 
   const requestToken = await waitForRequestToken(
     config.kite.redirect.path
   );
 
-  logger.info("request_token received, exchanging for access_token...");
+  logger.info("request_token received, exchanging for access_token...", {
+    requestTokenReceived: true,
+  });
+
+  logger.info("Calling generateSession...");
 
   const session = await kc.generateSession(requestToken, config.kite.apiSecret);
+  logger.info("generateSession completed successfully");
   kc.setAccessToken(session.access_token);
 
   logger.info("Authentication successful", {
